@@ -1,0 +1,195 @@
+name: 'Door43 Preview Actions'
+description: 'Load Door43 preview pages and generate PDFs'
+author: 'unfoldingWord'
+
+branding:
+  icon: 'book-open'
+  color: 'blue'
+
+inputs:
+  action:
+    description: 'Which action to run: "load-pages" or "create-pdfs"'
+    required: true
+  owner:
+    description: 'Repository owner (defaults to current repo owner)'
+    required: false
+  repo:
+    description: 'Repository name (defaults to current repo name)'
+    required: false
+  ref:
+    description: 'Git reference - branch or tag (defaults to current ref)'
+    required: false
+  books:
+    description: 'Space-separated list of book codes, or "all", "ot", "nt" (default: all)'
+    required: false
+    default: 'all'
+  output-dir:
+    description: 'Output directory for PDFs (only for create-pdfs action)'
+    required: false
+  page-size:
+    description: 'Page size: A4, LETTER, or both (only for create-pdfs action)'
+    required: false
+  backend:
+    description: 'PDF backend: playwright or weasyprint (only for create-pdfs action, default: weasyprint)'
+    required: false
+    default: 'weasyprint'
+  force:
+    description: 'Force regeneration even if files exist (only for create-pdfs action)'
+    required: false
+    default: 'false'
+  base-url:
+    description: 'Door43 preview base URL'
+    required: false
+    default: 'https://preview.door43.org'
+  navigation-timeout:
+    description: 'Navigation timeout in seconds'
+    required: false
+  cache-timeout:
+    description: 'Cache timeout in seconds (only for load-pages action)'
+    required: false
+  render-timeout:
+    description: 'Render timeout in seconds (only for create-pdfs action)'
+    required: false
+  verbose:
+    description: 'Enable verbose logging'
+    required: false
+    default: 'false'
+
+outputs:
+  books-loaded:
+    description: 'Number of books successfully loaded/generated'
+  books-failed:
+    description: 'Number of books that failed'
+  output-directory:
+    description: 'Directory containing generated PDFs (only for create-pdfs action)'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r ${{ github.action_path }}/requirements.txt
+        if [ "${{ inputs.action }}" = "create-pdfs" ] && [ "${{ inputs.backend }}" = "playwright" ]; then
+          playwright install --with-deps chromium
+        fi
+    
+    - name: Determine repository info
+      id: repo-info
+      shell: bash
+      run: |
+        # Determine owner
+        if [ -n "${{ inputs.owner }}" ]; then
+          echo "owner=${{ inputs.owner }}" >> $GITHUB_OUTPUT
+        else
+          echo "owner=${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+        fi
+        
+        # Determine repo name
+        if [ -n "${{ inputs.repo }}" ]; then
+          echo "repo=${{ inputs.repo }}" >> $GITHUB_OUTPUT
+        else
+          # Extract repo name from full repository path
+          repo_name=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          echo "repo=${repo_name}" >> $GITHUB_OUTPUT
+        fi
+        
+        # Determine ref
+        if [ -n "${{ inputs.ref }}" ]; then
+          echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
+        else
+          # Try to extract from GITHUB_REF
+          if [ -n "${{ github.ref_name }}" ]; then
+            echo "ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=master" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: Load preview pages
+      if: inputs.action == 'load-pages'
+      shell: bash
+      run: |
+        args=(
+          --owner "${{ steps.repo-info.outputs.owner }}"
+          --repo "${{ steps.repo-info.outputs.repo }}"
+          --ref "${{ steps.repo-info.outputs.ref }}"
+          --base-url "${{ inputs.base-url }}"
+        )
+        
+        # Add books
+        if [ -n "${{ inputs.books }}" ]; then
+          args+=(--books ${{ inputs.books }})
+        fi
+        
+        # Add optional timeouts
+        if [ -n "${{ inputs.navigation-timeout }}" ]; then
+          args+=(--navigation-timeout ${{ inputs.navigation-timeout }})
+        fi
+        if [ -n "${{ inputs.cache-timeout }}" ]; then
+          args+=(--cache-timeout ${{ inputs.cache-timeout }})
+        fi
+        
+        # Add verbose flag
+        if [ "${{ inputs.verbose }}" = "true" ]; then
+          args+=(--verbose)
+        fi
+        
+        python ${{ github.action_path }}/scripts/load_preview_pages.py "${args[@]}"
+    
+    - name: Create PDFs
+      if: inputs.action == 'create-pdfs'
+      shell: bash
+      run: |
+        args=(
+          --owner "${{ steps.repo-info.outputs.owner }}"
+          --repo "${{ steps.repo-info.outputs.repo }}"
+          --ref "${{ steps.repo-info.outputs.ref }}"
+          --base-url "${{ inputs.base-url }}"
+          --backend "${{ inputs.backend }}"
+        )
+        
+        # Add books
+        if [ -n "${{ inputs.books }}" ]; then
+          args+=(--books ${{ inputs.books }})
+        fi
+        
+        # Add output directory
+        if [ -n "${{ inputs.output-dir }}" ]; then
+          args+=(--output-dir "${{ inputs.output-dir }}")
+          echo "output-directory=${{ inputs.output-dir }}" >> $GITHUB_OUTPUT
+        else
+          args+=(--output-dir "output")
+          echo "output-directory=output" >> $GITHUB_OUTPUT
+        fi
+        
+        # Add page size
+        if [ -n "${{ inputs.page-size }}" ]; then
+          args+=(--page "${{ inputs.page-size }}")
+        fi
+        
+        # Add optional timeouts
+        if [ -n "${{ inputs.navigation-timeout }}" ]; then
+          args+=(--navigation-timeout ${{ inputs.navigation-timeout }})
+        fi
+        if [ -n "${{ inputs.render-timeout }}" ]; then
+          args+=(--render-timeout ${{ inputs.render-timeout }})
+        fi
+        
+        # Add force flag
+        if [ "${{ inputs.force }}" = "true" ]; then
+          args+=(--force)
+        fi
+        
+        # Add verbose flag
+        if [ "${{ inputs.verbose }}" = "true" ]; then
+          args+=(--verbose)
+        fi
+        
+        python ${{ github.action_path }}/scripts/create_door43_preview_pdfs.py "${args[@]}"
