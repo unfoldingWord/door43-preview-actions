@@ -71,12 +71,18 @@ runs:
       with:
         python-version: '3.10'
     
-    - name: Install dependencies
+    - name: Install Python dependencies
       shell: bash
       run: |
         python -m pip install --upgrade pip
         pip install -r ${{ github.action_path }}/requirements.txt
-        if [ "${{ inputs.action }}" = "create-pdfs" ] && [ "${{ inputs.backend }}" = "playwright" ]; then
+    
+    - name: Install Playwright browsers
+      shell: bash
+      run: |
+        # Install browsers for both load-pages (always needs it) and create-pdfs (when using playwright backend)
+        if [ "${{ inputs.action }}" = "load-pages" ] || [ "${{ inputs.backend }}" = "playwright" ]; then
+          echo "Installing Playwright Chromium browser..."
           playwright install --with-deps chromium
         fi
     

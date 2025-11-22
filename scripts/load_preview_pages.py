@@ -28,7 +28,7 @@ from playwright.async_api import async_playwright
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_BOOKS = ["all"]
+DEFAULT_BOOKS = ["gen", "exo", "lev", "num", "deu"]
 
 BIBLE_BOOK_DATA = {
     "gen": {"title": "Genesis", "testament": "old", "verse_count": 1533, "number": 1},
@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=DEFAULT_BOOKS,
         help="List of 3-letter book codes to load. Use 'all' for all available books, "
-             "'ot' for Old Testament, 'nt' for New Testament. (default: all available books).",
+             "'ot' for Old Testament, 'nt' for New Testament. (default: %(default)s).",
     )
     parser.add_argument(
         "--base-url",
@@ -304,12 +304,10 @@ async def wait_for_cache_html_post(page: Page, book: str | None, repo: str, time
     # Determine what URL pattern to look for
     if book is None:
         # For bookless repos, look for repo name in the path
-        # The URL will be like: path=u%2FunfoldingWord%2Fen_ta%2Fv87%2Fen_ta.json.gz
-        expected_pattern = f"%2F{repo}.json.gz"
+        expected_pattern = f"/{repo}.json.gz"
     else:
         # For book-based repos, look for book name in the path (lowercase)
-        # The URL will be like: path=u%2FunfoldingWord%2Fen_tn%2Fv76%2Frut.json.gz
-        expected_pattern = f"%2F{book.lower()}.json.gz"
+        expected_pattern = f"/{book.lower()}.json.gz"
     
     LOGGER.debug("Looking for cache-html POST with pattern: %s", expected_pattern)
     
