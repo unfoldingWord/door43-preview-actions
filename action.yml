@@ -80,11 +80,10 @@ runs:
     - name: Install Playwright browsers
       shell: bash
       run: |
-        # Install browsers for both load-pages (always needs it) and create-pdfs (when using playwright backend)
-        if [ "${{ inputs.action }}" = "load-pages" ] || [ "${{ inputs.backend }}" = "playwright" ]; then
-          echo "Installing Playwright Chromium browser..."
-          playwright install --with-deps chromium
-        fi
+        # Install browsers for both load-pages and create-pdfs actions
+        # (create-pdfs needs browser for HTML download even when using WeasyPrint backend)
+        echo "Installing Playwright Chromium browser..."
+        playwright install --with-deps chromium
     
     - name: Determine repository info
       id: repo-info
