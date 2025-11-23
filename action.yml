@@ -90,32 +90,26 @@ runs:
       shell: bash
       run: |
         # Determine owner
-        if [ -n "${{ inputs.owner }}" ]; then
-          echo "owner=${{ inputs.owner }}" >> $GITHUB_OUTPUT
-        else
-          echo "owner=${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+        OWNER="${{ inputs.owner }}"
+        if [ -z "$OWNER" ]; then
+          OWNER="${{ github.repository_owner }}"
         fi
+        echo "owner=$OWNER" >> $GITHUB_OUTPUT
         
         # Determine repo name
-        if [ -n "${{ inputs.repo }}" ]; then
-          echo "repo=${{ inputs.repo }}" >> $GITHUB_OUTPUT
-        else
+        REPO="${{ inputs.repo }}"
+        if [ -z "$REPO" ]; then
           # Extract repo name from full repository path
-          repo_name=$(echo "${{ github.repository }}" | cut -d'/' -f2)
-          echo "repo=${repo_name}" >> $GITHUB_OUTPUT
+          REPO=$(echo "${{ github.repository }}" | cut -d'/' -f2)
         fi
+        echo "repo=$REPO" >> $GITHUB_OUTPUT
         
         # Determine ref
-        if [ -n "${{ inputs.ref }}" ]; then
-          echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
-        else
-          # Try to extract from GITHUB_REF
-          if [ -n "${{ github.ref_name }}" ]; then
-            echo "ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "ref=master" >> $GITHUB_OUTPUT
-          fi
+        REF="${{ inputs.ref }}"
+        if [ -z "$REF" ]; then
+          REF="${{ github.ref_name }}"
         fi
+        echo "ref=$REF" >> $GITHUB_OUTPUT
     
     - name: Load preview pages
       if: inputs.action == 'load-pages'
