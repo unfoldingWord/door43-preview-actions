@@ -138,7 +138,7 @@ jobs:
         with:
           action: load-pages
           books: gen exo
-          owner: unfodlingWord
+          owner: unfoldingWord
           repo: en_tn
           ref: v87
           verbose: true
