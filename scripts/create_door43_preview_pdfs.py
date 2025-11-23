@@ -586,6 +586,14 @@ async def generate_pdf_for_book(
     else:
         page = await context.new_page()
         
+        # Hide automation indicators that might prevent React from loading content
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.navigator.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        """)
+        
         # Add network logging for debugging
         async def log_request(request):
             LOGGER.debug("→ REQUEST: %s %s", request.method, request.url)
@@ -667,8 +675,23 @@ async def run_export(
     successful_books = []
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
-        context = await browser.new_context(accept_downloads=True)
+        browser = await playwright.chromium.launch(
+            headless=headless,
+            args=[
+                '--disable-blink-features=AutomationControlled',  # Hide automation
+                '--disable-dev-shm-usage',  # Prevent crashes in Docker
+                '--no-sandbox',  # Required for Docker/CI environments
+            ]
+        )
+        context = await browser.new_context(
+            accept_downloads=True,
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',  # Real browser UA
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+            timezone_id='America/New_York',
+            ignore_https_errors=False,
+            java_script_enabled=True,
+        )
 
         try:
             for raw_book in books:
