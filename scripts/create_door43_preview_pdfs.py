@@ -585,6 +585,17 @@ async def generate_pdf_for_book(
         LOGGER.info("HTML already exists: %s (skipping download)", html_a4_path.name)
     else:
         page = await context.new_page()
+        
+        # Add network logging for debugging
+        async def log_request(request):
+            LOGGER.debug("→ REQUEST: %s %s", request.method, request.url)
+        
+        async def log_response(response):
+            LOGGER.debug("← RESPONSE: %s %s -> %d", response.request.method, response.url, response.status)
+        
+        page.on("request", log_request)
+        page.on("response", log_response)
+        
         try:
             page.set_default_timeout(render_timeout_ms)
             LOGGER.info("Navigating to %s", url)
@@ -594,6 +605,8 @@ async def generate_pdf_for_book(
             await open_print_drawer(page, render_timeout_ms)
             await download_printable_html(page, render_timeout_ms, html_a4_path)
         finally:
+            page.remove_listener("request", log_request)
+            page.remove_listener("response", log_response)
             await page.close()
 
     html_variants = {"A4": html_a4_path}
