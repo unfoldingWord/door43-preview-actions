@@ -366,17 +366,53 @@ def fetch_available_books(owner: str, repo: str, ref: str) -> List[str]:
 
 async def ensure_print_view(page: Page, timeout_ms: int) -> None:
     toggle = page.locator(PRINT_TOGGLE_SELECTOR)
-    await toggle.wait_for(state="visible", timeout=timeout_ms)
+    try:
+        await toggle.wait_for(state="visible", timeout=timeout_ms)
+        aria_pressed = await toggle.get_attribute("aria-pressed")
+        if aria_pressed != "true":
+            LOGGER.debug("Enabling print preview toggle")
+            await toggle.click()
+            await page.wait_for_function(
+                "selector => document.querySelector(selector)?.getAttribute('aria-pressed') === 'true'",
+                arg=PRINT_TOGGLE_SELECTOR,
+                timeout=timeout_ms,
+            )
+        return
+    except PlaywrightTimeoutError:
+        LOGGER.debug("Print toggle not found via primary selector, trying fallbacks")
 
-    aria_pressed = await toggle.get_attribute("aria-pressed")
-    if aria_pressed != "true":
-        LOGGER.debug("Enabling print preview toggle")
-        await toggle.click()
+    # Fallbacks: the print UI can expose a direct download button or other
+    # variations. Try to detect the download button or a drawer icon, or
+    # finally wait for the main content to be present as a last resort.
+    try:
+        # If the download button is directly available, accept it
+        await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms / 3)
+        LOGGER.debug("Found HTML download button without toggling print view")
+        return
+    except PlaywrightTimeoutError:
+        LOGGER.debug("HTML download button not visible as fallback")
+
+    try:
+        # Try the print options icon (alternate UI path)
+        await page.wait_for_selector(PRINT_ICON_SELECTOR, state="visible", timeout=timeout_ms / 3)
+        LOGGER.debug("Found print options icon via fallback; clicking it")
+        await page.locator(PRINT_ICON_SELECTOR).click()
+        await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms / 3)
+        return
+    except PlaywrightTimeoutError:
+        LOGGER.debug("Print icon fallback also failed")
+
+    # Last resort: wait for a main content indicator (pagedjs or book element)
+    try:
         await page.wait_for_function(
-            "selector => document.querySelector(selector)?.getAttribute('aria-pressed') === 'true'",
-            arg=PRINT_TOGGLE_SELECTOR,
-            timeout=timeout_ms,
+            "() => document.querySelector('.pagedjs_pages') || document.querySelector('[data-book]') || document.querySelector('main')",
+            timeout=timeout_ms / 3,
         )
+        LOGGER.warning("Proceeding despite not seeing explicit print UI; main content detected")
+        return
+    except PlaywrightTimeoutError:
+        LOGGER.error("Failed to find print UI or main content within timeout")
+        raise
 
 
 async def open_print_drawer(page: Page, timeout_ms: int) -> None:
