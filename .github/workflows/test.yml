@@ -13,7 +13,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Test load pages with specific repo
         uses: ./
         with:
@@ -23,14 +23,15 @@ jobs:
           ref: v87
           books: rut
           verbose: true
-  
+
+
   test-create-pdfs-weasyprint:
     name: Test Create PDFs (WeasyPrint)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Generate PDFs with WeasyPrint
         uses: ./
         with:
@@ -42,26 +43,26 @@ jobs:
           backend: weasyprint
           output-dir: pdfs-weasyprint
           verbose: true
-      
+
       - name: Check PDFs were created
         run: |
           ls -lh pdfs-weasyprint/
           test -f pdfs-weasyprint/en_tn_08-RUT_v87_A4.pdf
           test -f pdfs-weasyprint/en_tn_08-RUT_v87_LETTER.pdf
-      
+
       - name: Upload PDFs
         uses: actions/upload-artifact@v4
         with:
           name: test-pdfs-weasyprint
           path: pdfs-weasyprint/*.pdf
-  
+
   test-create-pdfs-playwright:
     name: Test Create PDFs (Playwright)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Generate PDFs with Playwright
         uses: ./
         with:
@@ -73,26 +74,26 @@ jobs:
           backend: playwright
           output-dir: pdfs-playwright
           verbose: true
-      
+
       - name: Check PDFs were created
         run: |
           ls -lh pdfs-playwright/
           test -f pdfs-playwright/en_tn_58-PHM_v87_A4.pdf
           test -f pdfs-playwright/en_tn_58-PHM_v87_LETTER.pdf
-      
+
       - name: Upload PDFs
         uses: actions/upload-artifact@v4
         with:
           name: test-pdfs-playwright
           path: pdfs-playwright/*.pdf
-  
+
   test-bookless-repo:
     name: Test Bookless Repo (en_ta)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Load pages for bookless repo
         uses: ./
         with:
@@ -101,7 +102,7 @@ jobs:
           repo: en_ta
           ref: v87
           verbose: true
-      
+
       - name: Generate PDF for bookless repo
         uses: ./
         with:
@@ -112,33 +113,36 @@ jobs:
           backend: weasyprint
           output-dir: pdfs-en_ta
           verbose: true
-      
+
       - name: Check PDF was created
         run: |
           ls -lh pdfs-en_ta/
           test -f pdfs-en_ta/en_ta_v87_A4.pdf
           test -f pdfs-en_ta/en_ta_v87_LETTER.pdf
-      
+
       - name: Upload PDF
         uses: actions/upload-artifact@v4
         with:
           name: test-pdfs-en_ta
           path: pdfs-en_ta/*.pdf
-  
+
   test-auto-detect:
     name: Test Auto-detection
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Load pages with auto-detection
         uses: ./
         with:
           action: load-pages
           books: gen exo
+          owner: unfodlingWord
+          repo: en_tn
+          ref: v87
           verbose: true
-      
+
       - name: Show detected values
         run: |
           echo "Repository: ${{ github.repository }}"
