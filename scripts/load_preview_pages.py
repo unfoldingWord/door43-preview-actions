@@ -292,8 +292,16 @@ def fetch_available_books(owner: str, repo: str, ref: str) -> List[str]:
     return available
 
 
-async def wait_for_cache_html_post(page: Page, book: str | None, repo: str, timeout_ms: int) -> None:
-    """Wait for the main book cache-html POST request to complete."""
+async def wait_for_cache_html_post(page: Page, book: str | None, repo: str, timeout_ms: int, require_post: bool = False) -> None:
+    """Wait for the main book cache-html POST request to complete.
+    
+    Args:
+        page: Playwright page object
+        book: Book code or None for bookless repos
+        repo: Repository name
+        timeout_ms: Timeout in milliseconds
+        require_post: If False, don't fail if no POST is seen (content may be already cached)
+    """
     LOGGER.debug("Waiting for main book cache-html POST request")
     
     cache_html_completed = asyncio.Event()
@@ -342,6 +350,12 @@ async def wait_for_cache_html_post(page: Page, book: str | None, repo: str, time
         LOGGER.info("Page successfully loaded and cached")
         
     except asyncio.TimeoutError:
+        if not require_post:
+            # If we don't require seeing the POST, assume the page loaded successfully
+            # (it may have been cached already)
+            LOGGER.info("No cache-html POST seen, but page loaded successfully (may be already cached)")
+            return
+        
         LOGGER.error("Timeout waiting for main book cache-html POST after %dms", timeout_ms)
         LOGGER.error("Total requests made: %d", len(all_requests))
         LOGGER.error("Total responses received: %d", len(all_responses))
@@ -384,7 +398,10 @@ async def load_preview_page(
         LOGGER.info("Navigating to %s", url)
         
         # Start waiting for cache-html POST before navigation
-        cache_task = asyncio.create_task(wait_for_cache_html_post(page, book, repo, cache_timeout_ms))
+        # Use require_post=False so we don't fail if content is already cached
+        cache_task = asyncio.create_task(
+            wait_for_cache_html_post(page, book, repo, cache_timeout_ms, require_post=False)
+        )
         
         await page.goto(url, wait_until="networkidle", timeout=navigation_timeout_ms)
         
