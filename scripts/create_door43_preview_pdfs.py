@@ -226,6 +226,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force re-download HTML and re-generate PDFs even if files already exist.",
     )
+    parser.add_argument(
+        "--html-only",
+        action="store_true",
+        help="Download HTML files only without generating PDFs. Useful for offline PDF generation later.",
+    )
 
     parser.set_defaults(headless=True)
     args = parser.parse_args()
@@ -253,8 +258,8 @@ def resolve_page_sizes(selection: str | None) -> Tuple[str, ...]:
 
 def build_url(base_url: str, owner: str, repo: str, ref: str, book: str | None) -> str:
     if book is None:
-        return f"{base_url}/u/{owner}/{repo}/{ref}/"
-    return f"{base_url}/u/{owner}/{repo}/{ref}/?book={book}"
+        return f"{base_url}/u/{owner}/{repo}/{ref}/?rerender=1"
+    return f"{base_url}/u/{owner}/{repo}/{ref}/?rerender=1&book={book}"
 
 
 def build_output_prefix(owner: str, repo: str, ref: str, book: str | None) -> str:
@@ -365,10 +370,12 @@ def fetch_available_books(owner: str, repo: str, ref: str) -> List[str]:
 
 
 async def ensure_print_view(page: Page, timeout_ms: int) -> None:
+    LOGGER.debug("Looking for print toggle button...")
     toggle = page.locator(PRINT_TOGGLE_SELECTOR)
     try:
         await toggle.wait_for(state="visible", timeout=timeout_ms)
         aria_pressed = await toggle.get_attribute("aria-pressed")
+        LOGGER.debug(f"Print toggle found, aria-pressed={aria_pressed}")
         if aria_pressed != "true":
             LOGGER.debug("Enabling print preview toggle")
             await toggle.click()
@@ -377,6 +384,7 @@ async def ensure_print_view(page: Page, timeout_ms: int) -> None:
                 arg=PRINT_TOGGLE_SELECTOR,
                 timeout=timeout_ms,
             )
+        LOGGER.debug("Print view enabled successfully")
         return
     except PlaywrightTimeoutError:
         LOGGER.debug("Print toggle not found via primary selector, trying fallbacks")
@@ -386,6 +394,7 @@ async def ensure_print_view(page: Page, timeout_ms: int) -> None:
     # finally wait for the main content to be present as a last resort.
     try:
         # If the download button is directly available, accept it
+        LOGGER.debug(f"Looking for HTML download button: {HTML_DOWNLOAD_BUTTON_SELECTOR}")
         await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms / 3)
         LOGGER.debug("Found HTML download button without toggling print view")
         return
@@ -394,43 +403,97 @@ async def ensure_print_view(page: Page, timeout_ms: int) -> None:
 
     try:
         # Try the print options icon (alternate UI path)
+        LOGGER.debug(f"Looking for print options icon: {PRINT_ICON_SELECTOR}")
         await page.wait_for_selector(PRINT_ICON_SELECTOR, state="visible", timeout=timeout_ms / 3)
         LOGGER.debug("Found print options icon via fallback; clicking it")
         await page.locator(PRINT_ICON_SELECTOR).click()
         await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms / 3)
+        LOGGER.debug("Print drawer opened successfully")
         return
     except PlaywrightTimeoutError:
         LOGGER.debug("Print icon fallback also failed")
 
     # Last resort: wait for a main content indicator (pagedjs or book element)
     try:
+        LOGGER.debug("Trying last resort: looking for main content...")
         await page.wait_for_function(
             "() => document.querySelector('.pagedjs_pages') || document.querySelector('[data-book]') || document.querySelector('main')",
             timeout=timeout_ms / 3,
         )
-        LOGGER.warning("Proceeding despite not seeing explicit print UI; main content detected")
+        LOGGER.info("Main content detected - proceeding without print UI")
+        
+        # List what we can see on the page for debugging
+        if LOGGER.level == logging.DEBUG:
+            buttons = await page.query_selector_all('button')
+            LOGGER.debug(f"Found {len(buttons)} button elements on page")
+            for i, button in enumerate(buttons[:5]):
+                aria_label = await button.get_attribute('aria-label')
+                text = await button.inner_text()
+                LOGGER.debug(f"  Button {i+1}: aria-label='{aria_label}', text='{text[:50]}'")
+        
         return
     except PlaywrightTimeoutError:
-        LOGGER.error("Failed to find print UI or main content within timeout")
-        raise
+        LOGGER.warning("Could not find print UI or main content")
+        LOGGER.warning("Will attempt to extract HTML directly from current page state")
+        # Don't raise - let download_printable_html try to extract from DOM
+        return
 
 
 async def open_print_drawer(page: Page, timeout_ms: int) -> None:
-    LOGGER.debug("Opening print options drawer")
-    await page.wait_for_selector(PRINT_ICON_SELECTOR, state="visible", timeout=timeout_ms)
-    await page.locator(PRINT_ICON_SELECTOR).click()
-    await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms)
+    """Try to open print drawer, but don't fail if not available."""
+    LOGGER.debug("Attempting to open print options drawer")
+    try:
+        await page.wait_for_selector(PRINT_ICON_SELECTOR, state="visible", timeout=min(timeout_ms, 5000))
+        LOGGER.debug(f"Found print icon: {PRINT_ICON_SELECTOR}")
+        await page.locator(PRINT_ICON_SELECTOR).click()
+        await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=min(timeout_ms, 5000))
+        LOGGER.debug("Print drawer opened and download button visible")
+    except PlaywrightTimeoutError:
+        LOGGER.warning(f"Could not open print drawer - this is OK, will extract HTML directly from DOM")
+    except Exception as e:
+        LOGGER.warning(f"Error opening print drawer: {e} - will extract HTML directly from DOM")
 
 
 async def download_printable_html(page: Page, timeout_ms: int, destination: Path) -> Path:
     LOGGER.info("Downloading printable HTML to %s", destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms)
-    async with page.expect_download(timeout=timeout_ms) as download_info:
-        await page.locator(HTML_DOWNLOAD_BUTTON_SELECTOR).click()
-    download = await download_info.value
-    await download.save_as(str(destination))
-    return destination
+    
+    # Try the normal download button flow first
+    try:
+        await page.wait_for_selector(HTML_DOWNLOAD_BUTTON_SELECTOR, state="visible", timeout=timeout_ms)
+        async with page.expect_download(timeout=timeout_ms) as download_info:
+            await page.locator(HTML_DOWNLOAD_BUTTON_SELECTOR).click()
+        download = await download_info.value
+        await download.save_as(str(destination))
+        LOGGER.info("HTML downloaded successfully via download button")
+        return destination
+    except PlaywrightTimeoutError:
+        LOGGER.warning("Download button method failed, trying direct HTML extraction...")
+    except Exception as e:
+        LOGGER.warning(f"Download button method failed ({e}), trying direct HTML extraction...")
+    
+    # Fallback: Extract HTML directly from the page DOM
+    # This works even if the server-side caching POST fails
+    try:
+        LOGGER.info("Extracting rendered HTML directly from page DOM...")
+        
+        # Wait for content to be rendered (wait for main content or pagedjs)
+        await page.wait_for_function(
+            "() => document.querySelector('.pagedjs_pages') || document.querySelector('[data-book]') || document.querySelector('main')",
+            timeout=timeout_ms,
+        )
+        
+        # Get the full HTML content
+        html_content = await page.content()
+        
+        # Save it
+        destination.write_text(html_content, encoding='utf-8')
+        LOGGER.info(f"HTML extracted successfully ({len(html_content) / (1024*1024):.2f} MB)")
+        return destination
+        
+    except Exception as e:
+        LOGGER.error(f"Failed to extract HTML from page: {e}")
+        raise
 
 
 def create_letter_variant(source_html: Path, destination_html: Path) -> Path:
@@ -576,6 +639,7 @@ async def generate_pdf_for_book(
     sleep_after_ready: float,
     backend: str = "playwright",
     force: bool = False,
+    html_only: bool = False,
 ) -> None:
     prefix = build_output_prefix(owner, repo, ref, book)
     html_a4_path = output_dir / f"{prefix}_A4.html"
@@ -608,14 +672,60 @@ async def generate_pdf_for_book(
             page.set_default_timeout(render_timeout_ms)
             LOGGER.info("Navigating to %s", url)
             await page.goto(url, wait_until="networkidle", timeout=navigation_timeout_ms)
+            
+            LOGGER.debug("Page loaded, waiting for content to render...")
+            
+            # Give React/Vue time to render the content
+            # This is especially important for Netlify preview environments
+            await page.wait_for_timeout(2000)
+            
+            # Take a screenshot for debugging if verbose
+            if LOGGER.level == logging.DEBUG:
+                screenshot_path = output_dir / f"{prefix}_debug_screenshot.png"
+                await page.screenshot(path=str(screenshot_path))
+                LOGGER.debug(f"Screenshot saved to {screenshot_path}")
 
             await ensure_print_view(page, render_timeout_ms)
             await open_print_drawer(page, render_timeout_ms)
             await download_printable_html(page, render_timeout_ms, html_a4_path)
+        except PlaywrightTimeoutError as e:
+            LOGGER.error(f"Timeout while processing {url}")
+            LOGGER.error(f"Error: {e}")
+            
+            # Save page content for debugging
+            debug_html = output_dir / f"{prefix}_debug_page.html"
+            content = await page.content()
+            debug_html.write_text(content, encoding='utf-8')
+            LOGGER.error(f"Page HTML saved to {debug_html} for debugging")
+            
+            # Save screenshot
+            debug_screenshot = output_dir / f"{prefix}_debug_error.png"
+            await page.screenshot(path=str(debug_screenshot), full_page=True)
+            LOGGER.error(f"Screenshot saved to {debug_screenshot}")
+            
+            raise
+        except Exception as e:
+            LOGGER.error(f"Unexpected error while processing {url}: {e}")
+            raise
         finally:
             page.remove_listener("request", log_request)
             page.remove_listener("response", log_response)
             await page.close()
+
+    # If html_only mode, skip PDF generation
+    if html_only:
+        LOGGER.info("HTML-only mode: skipping PDF generation for %s", prefix)
+        # Still create LETTER variant HTML if needed
+        if "LETTER" in page_sizes:
+            letter_html_path = output_dir / f"{prefix}_LETTER.html"
+            if letter_html_path.exists() and not force:
+                LOGGER.info("LETTER HTML already exists: %s (skipping creation)", letter_html_path.name)
+            else:
+                create_letter_variant(
+                    source_html=html_a4_path,
+                    destination_html=letter_html_path,
+                )
+        return
 
     html_variants = {"A4": html_a4_path}
     if "LETTER" in page_sizes:
@@ -668,6 +778,7 @@ async def run_export(
     page_sizes: Tuple[str, ...],
     backend: str = "playwright",
     force: bool = False,
+    html_only: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -737,6 +848,7 @@ async def run_export(
                         sleep_after_ready=sleep_after_ready,
                         backend=backend,
                         force=force,
+                        html_only=html_only,
                     )
                     LOGGER.info("Successfully completed %s", display_name)
                     successful_books.append(display_name)
@@ -771,7 +883,10 @@ async def run_export(
     LOGGER.info("=" * 60)
     LOGGER.info("EXPORT SUMMARY")
     LOGGER.info("=" * 60)
-    LOGGER.info("Successfully generated: %d book(s)", len(successful_books))
+    if html_only:
+        LOGGER.info("Successfully downloaded HTML: %d book(s)", len(successful_books))
+    else:
+        LOGGER.info("Successfully generated: %d book(s)", len(successful_books))
     if successful_books:
         LOGGER.info("  %s", ", ".join(successful_books))
     
@@ -846,6 +961,9 @@ def main() -> int:
         len(selected_books),
         ", ".join(page_sizes),
     )
+    
+    if args.html_only:
+        LOGGER.info("HTML-only mode: PDFs will NOT be generated")
 
     try:
         asyncio.run(
@@ -865,6 +983,7 @@ def main() -> int:
                 page_sizes=page_sizes,
                 backend=args.backend,
                 force=args.force,
+                html_only=args.html_only,
             )
         )
     except RenderTimeoutError as error:
