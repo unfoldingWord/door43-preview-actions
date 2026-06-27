@@ -15,12 +15,13 @@ import asyncio
 import gc
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.request
 from math import ceil
 from pathlib import Path
-from typing import Iterable, List, Tuple, Optional
+from typing import Dict, Iterable, List, Tuple, Optional
 
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -114,6 +115,7 @@ PRINT_TOGGLE_SELECTOR = 'button[aria-label^="Print view"]'
 PRINT_ICON_SELECTOR = 'button[aria-label^="Open print options"]'
 DRAWER_PRINT_SELECTOR = 'button[aria-label="Print"]'
 HTML_DOWNLOAD_BUTTON_SELECTOR = 'button[aria-label="Download the HTML for printing"]'
+PAGEDJS_CONTAINER_PATTERN = re.compile(r'<div[^>]*id=["\']pagedjs-print["\'][^>]*>', re.IGNORECASE)
 
 
 class RenderTimeoutError(RuntimeError):
@@ -134,14 +136,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--books",
         nargs="+",
-        default=DEFAULT_BOOKS,
+        default=None,
         help="List of 3-letter book codes to export. Use 'all' for all available books, "
-             "'ot' for Old Testament, 'nt' for New Testament. (default: %(default)s).",
+             "'ot' for Old Testament, 'nt' for New Testament. "
+             "If not specified, all books from the catalog will be processed.",
     )
     parser.add_argument(
         "--base-url",
         default="https://preview.door43.org",
         help="Door43 preview base URL.",
+    )
+    parser.add_argument(
+        "--server",
+        default=None,
+        help="Value for the preview app's '?server=' query param (e.g. 'prod'). "
+             "Use when rendering via develop-preview.door43.org against production DCS data.",
+    )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Bypass any HTTP(S) proxy for this process only (clears *_PROXY env for the "
+             "Python+Chromium subprocess and forces Chromium '--no-proxy-server'). Use when "
+             "door43 is reachable directly but a system/VPN proxy is slow or flaky; your other "
+             "processes (and their VPN) are unaffected.",
     )
     parser.add_argument(
         "--owner",
@@ -231,6 +248,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Download HTML files only without generating PDFs. Useful for offline PDF generation later.",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Generate one combined PDF for all selected books. In this mode, book HTML files are downloaded first, "
+             "then merged into a single all-books HTML/PDF.",
+    )
 
     parser.set_defaults(headless=True)
     args = parser.parse_args()
@@ -256,10 +279,11 @@ def resolve_page_sizes(selection: str | None) -> Tuple[str, ...]:
     return (normalized,)
 
 
-def build_url(base_url: str, owner: str, repo: str, ref: str, book: str | None) -> str:
+def build_url(base_url: str, owner: str, repo: str, ref: str, book: str | None, server: str | None = None) -> str:
+    suffix = f"&server={server}" if server else ""
     if book is None:
-        return f"{base_url}/u/{owner}/{repo}/{ref}/?rerender=1"
-    return f"{base_url}/u/{owner}/{repo}/{ref}/?rerender=1&book={book}"
+        return f"{base_url}/u/{owner}/{repo}/{ref}/?rerender=1{suffix}"
+    return f"{base_url}/u/{owner}/{repo}/{ref}/?rerender=1&book={book}{suffix}"
 
 
 def build_output_prefix(owner: str, repo: str, ref: str, book: str | None) -> str:
@@ -367,6 +391,225 @@ def fetch_available_books(owner: str, repo: str, ref: str) -> List[str]:
 
     LOGGER.debug("Catalog provides %d Bible book(s)", len(available))
     return available
+
+
+def sort_books_canonical(books: Iterable[str]) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    for raw_code in books:
+        code = raw_code.lower()
+        if code in seen:
+            continue
+        deduped.append(code)
+        seen.add(code)
+
+    return sorted(
+        deduped,
+        key=lambda code: (
+            BIBLE_BOOK_DATA.get(code, {}).get("number", 999),
+            code,
+        ),
+    )
+
+
+def find_matching_tag_end(document: str, tag_start: int, tag_name: str) -> int:
+    lower_document = document.lower()
+    lower_tag_name = tag_name.lower()
+    open_tag_end = lower_document.find(">", tag_start)
+    if open_tag_end == -1:
+        raise ValueError(f"Malformed <{tag_name}> tag starting at index {tag_start}")
+
+    open_pattern = f"<{lower_tag_name}"
+    close_pattern = f"</{lower_tag_name}>"
+
+    cursor = open_tag_end + 1
+    depth = 1
+    while depth > 0:
+        next_open = lower_document.find(open_pattern, cursor)
+        next_close = lower_document.find(close_pattern, cursor)
+
+        if next_close == -1:
+            raise ValueError(f"Missing closing tag </{tag_name}>")
+
+        if next_open != -1 and next_open < next_close:
+            depth += 1
+            cursor = next_open + len(open_pattern)
+            continue
+
+        depth -= 1
+        cursor = next_close + len(close_pattern)
+
+    return cursor
+
+
+def split_top_level_divs(container_content: str) -> List[str]:
+    blocks: List[str] = []
+    lower_content = container_content.lower()
+    cursor = 0
+
+    while True:
+        next_open = lower_content.find("<div", cursor)
+        if next_open == -1:
+            break
+
+        block_end = find_matching_tag_end(container_content, next_open, "div")
+        blocks.append(container_content[next_open:block_end])
+        cursor = block_end
+
+    return blocks
+
+
+def extract_pagedjs_sections(html_content: str) -> Tuple[str, str, List[str], str]:
+    container_match = PAGEDJS_CONTAINER_PATTERN.search(html_content)
+    if container_match is None:
+        raise ValueError("Could not locate pagedjs-print container in HTML")
+
+    container_start = container_match.start()
+    container_open_tag = container_match.group(0)
+    container_end = find_matching_tag_end(html_content, container_start, "div")
+    container_inner = html_content[container_match.end():container_end - len("</div>")]
+    sections = split_top_level_divs(container_inner)
+
+    return (
+        html_content[:container_start],
+        container_open_tag,
+        sections,
+        html_content[container_end:],
+    )
+
+
+def find_cover_section(sections: Iterable[str]) -> Optional[str]:
+    for section in sections:
+        if "cover-page" in section:
+            return section
+    return None
+
+
+def find_copyright_section(sections: Iterable[str]) -> Optional[str]:
+    for section in sections:
+        if 'id="copyright-page"' in section or "id='copyright-page'" in section:
+            return section
+    return None
+
+
+def find_book_section(sections: Iterable[str], book_code: str) -> Optional[str]:
+    pattern = re.compile(rf'id=["\']nav-{re.escape(book_code.lower())}["\']', re.IGNORECASE)
+    for section in sections:
+        if pattern.search(section):
+            return section
+    return None
+
+
+def remove_book_name_from_cover(cover_section: str, book_title: str) -> str:
+    if not book_title:
+        return cover_section
+
+    updated = re.sub(
+        rf"\s*<h[1-6](?![^>]*cover-version)[^>]*>\s*{re.escape(book_title)}\s*</h[1-6]>\s*",
+        "\n",
+        cover_section,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    updated = re.sub(
+        rf"(<h[1-6][^>]*>[^<]*?)\s*-\s*{re.escape(book_title)}(\s*</h[1-6]>)",
+        r"\1\2",
+        updated,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return updated
+
+
+def build_all_books_toc_section(book_codes: Iterable[str]) -> str:
+    entries: List[str] = []
+    for code in book_codes:
+        title = BIBLE_BOOK_DATA.get(code, {}).get("title", code.upper())
+        entries.append(
+            "\n".join(
+                [
+                    '<li class="toc-entry">',
+                    f'  <a class="toc-element" href="#nav-{code}"><span class="toc-element-title">{title}</span></a>',
+                    "</li>",
+                ]
+            )
+        )
+
+    toc_items = "\n".join(entries)
+    return (
+        '<div class="section toc-page">\n'
+        '  <h1 class="header toc-header">Table of Contents</h1>\n'
+        '  <div id="toc-contents">\n'
+        '    <ul class="toc-section top-toc-section">\n'
+        f"{toc_items}\n"
+        "    </ul>\n"
+        "  </div>\n"
+        "</div>"
+    )
+
+
+def build_all_books_output_prefix(repo: str, ref: str) -> str:
+    return f"{repo}_ALL_{ref}"
+
+
+def build_all_books_html(
+    repo: str,
+    ref: str,
+    ordered_books: Iterable[str],
+    book_html_paths: Dict[str, Path],
+) -> str:
+    ordered = [book.lower() for book in ordered_books]
+    if not ordered:
+        raise ValueError("No books were provided for all-books HTML generation")
+
+    missing = [book for book in ordered if book not in book_html_paths]
+    if missing:
+        raise ValueError(
+            f"Missing HTML files for {len(missing)} book(s): {', '.join(book.upper() for book in missing)}"
+        )
+
+    first_book = ordered[0]
+    first_html = book_html_paths[first_book].read_text(encoding="utf-8")
+    prefix, container_open_tag, first_sections, suffix = extract_pagedjs_sections(first_html)
+
+    cover_section = find_cover_section(first_sections)
+    if cover_section is None:
+        raise ValueError(f"Could not locate cover page in {book_html_paths[first_book]}")
+
+    cover_section = remove_book_name_from_cover(
+        cover_section,
+        BIBLE_BOOK_DATA.get(first_book, {}).get("title", ""),
+    )
+
+    copyright_section = find_copyright_section(first_sections)
+    if copyright_section is None:
+        raise ValueError(f"Could not locate copyright page in {book_html_paths[first_book]}")
+
+    merged_sections: List[str] = [
+        cover_section,
+        copyright_section,
+        build_all_books_toc_section(ordered),
+    ]
+
+    for book in ordered:
+        html_content = book_html_paths[book].read_text(encoding="utf-8")
+        _, _, sections, _ = extract_pagedjs_sections(html_content)
+        book_section = find_book_section(sections, book)
+        if book_section is None:
+            raise ValueError(f"Could not locate nav-{book} section in {book_html_paths[book]}")
+        merged_sections.append(book_section)
+
+    merged_content = "\n".join(merged_sections)
+    merged_html = f"{prefix}{container_open_tag}\n{merged_content}\n</div>{suffix}"
+    merged_title = f"{repo} {ref} - All Books"
+
+    return re.sub(
+        r"<title>.*?</title>",
+        f"<title>{merged_title}</title>",
+        merged_html,
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 async def ensure_print_view(page: Page, timeout_ms: int) -> None:
@@ -502,11 +745,13 @@ def create_letter_variant(source_html: Path, destination_html: Path) -> Path:
     content = source_html.read_text(encoding="utf-8")
     updated, replacements = LETTER_SIZE_PATTERN.subn(r"\1letter;", content, count=1)
     if replacements == 0:
-        LOGGER.warning(
-            "Could not find A4 size declaration in %s; writing unmodified content for Letter variant",
-            source_html,
+        raise RuntimeError(
+            f"Could not find the A4 '@page {{ size: 210mm 297mm; }}' declaration in "
+            f"{source_html.name}; the Letter variant would be a byte-identical A4 copy. "
+            "Aborting this book rather than emitting a mislabeled PDF. The source print "
+            "HTML's @page size rule likely changed upstream -- update LETTER_SIZE_PATTERN "
+            "to match the new declaration."
         )
-        updated = content
     destination_html.write_text(updated, encoding="utf-8")
     return destination_html
 
@@ -539,20 +784,18 @@ def render_html_to_pdf_weasyprint(
         page_size: Page size format ("A4" or "LETTER")
     """
     LOGGER.info("Writing %s PDF to %s using WeasyPrint", page_size, destination)
-    
-    # Map page size to WeasyPrint format
-    page_format = PAGE_FORMAT_MAP[page_size]  # "A4" or "Letter"
-    
+
     try:
         # Read HTML content as UTF-8
         html_content = html_path.read_text(encoding='utf-8')
         # Use base_url to resolve relative paths in the HTML (for images, CSS, etc.)
         # Must use resolve() to convert relative path to absolute path before as_uri()
         html_doc = HTML(string=html_content, base_url=html_path.resolve().parent.as_uri() + '/')
-        html_doc.write_pdf(
-            str(destination),
-            page_size=page_format,
-        )
+        # The page size comes from the HTML's own `@page { size: ... }` rule. WeasyPrint
+        # has no page-size argument -- passing page_size= just logged "Unknown rendering
+        # option" and did nothing -- so the A4/LETTER distinction is baked into the HTML
+        # by create_letter_variant() before we get here.
+        html_doc.write_pdf(str(destination))
         LOGGER.debug("Successfully rendered %s PDF", page_size)
         
         # Explicitly clean up to free memory
@@ -640,7 +883,7 @@ async def generate_pdf_for_book(
     backend: str = "playwright",
     force: bool = False,
     html_only: bool = False,
-) -> None:
+) -> Path:
     prefix = build_output_prefix(owner, repo, ref, book)
     html_a4_path = output_dir / f"{prefix}_A4.html"
     
@@ -671,13 +914,21 @@ async def generate_pdf_for_book(
         try:
             page.set_default_timeout(render_timeout_ms)
             LOGGER.info("Navigating to %s", url)
-            await page.goto(url, wait_until="networkidle", timeout=navigation_timeout_ms)
+            
+            # For localhost/dev servers (Vite), use 'domcontentloaded' instead of 'networkidle'
+            # because Vite keeps making requests and never reaches networkidle
+            is_localhost = url.startswith("http://localhost") or url.startswith("http://127.0.0.1")
+            wait_until = "domcontentloaded" if is_localhost else "networkidle"
+            
+            LOGGER.debug("Using wait strategy: %s (localhost=%s)", wait_until, is_localhost)
+            await page.goto(url, wait_until=wait_until, timeout=navigation_timeout_ms)
             
             LOGGER.debug("Page loaded, waiting for content to render...")
             
             # Give React/Vue time to render the content
-            # This is especially important for Netlify preview environments
-            await page.wait_for_timeout(2000)
+            # Increase wait time for localhost since we're not waiting for networkidle
+            wait_time = 5000 if is_localhost else 2000
+            await page.wait_for_timeout(wait_time)
             
             # Take a screenshot for debugging if verbose
             if LOGGER.level == logging.DEBUG:
@@ -725,7 +976,7 @@ async def generate_pdf_for_book(
                     source_html=html_a4_path,
                     destination_html=letter_html_path,
                 )
-        return
+        return html_a4_path
 
     html_variants = {"A4": html_a4_path}
     if "LETTER" in page_sizes:
@@ -761,10 +1012,14 @@ async def generate_pdf_for_book(
             backend=backend,
         )
 
+    return html_a4_path
+
 
 async def run_export(
-    books: Iterable[str],
+    books: Iterable[str | None],
     base_url: str,
+    server: str | None,
+    no_proxy: bool,
     owner: str,
     repo: str,
     ref: str,
@@ -779,20 +1034,30 @@ async def run_export(
     backend: str = "playwright",
     force: bool = False,
     html_only: bool = False,
+    combine_all: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     failed_books = []
     successful_books = []
+    combined_outputs: List[str] = []
+    downloaded_book_html: Dict[str, Path] = {}
+    book_sequence = list(books)
+    per_book_html_only = html_only or combine_all
+    download_page_sizes = ("A4",) if combine_all else page_sizes
+
+    launch_args = [
+        '--disable-blink-features=AutomationControlled',  # Hide automation
+        '--disable-dev-shm-usage',  # Prevent crashes in Docker
+        '--no-sandbox',  # Required for Docker/CI environments
+    ]
+    if no_proxy:
+        launch_args.append('--no-proxy-server')  # Force a direct connection (bypass system/VPN proxy)
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=headless,
-            args=[
-                '--disable-blink-features=AutomationControlled',  # Hide automation
-                '--disable-dev-shm-usage',  # Prevent crashes in Docker
-                '--no-sandbox',  # Required for Docker/CI environments
-            ]
+            args=launch_args,
         )
         context = await browser.new_context(
             accept_downloads=True,
@@ -805,10 +1070,10 @@ async def run_export(
         )
 
         try:
-            for raw_book in books:
+            for raw_book in book_sequence:
                 # Handle None for bookless repos
                 book = raw_book.lower() if raw_book is not None else None
-                url = build_url(base_url, owner, repo, ref, book)
+                url = build_url(base_url, owner, repo, ref, book, server=server)
                 
                 if book is None:
                     # For bookless repos, use default timeouts
@@ -834,7 +1099,7 @@ async def run_export(
                 )
 
                 try:
-                    await generate_pdf_for_book(
+                    downloaded_html_path = await generate_pdf_for_book(
                         context=context,
                         owner=owner,
                         repo=repo,
@@ -842,16 +1107,18 @@ async def run_export(
                         book=book,
                         url=url,
                         output_dir=output_dir,
-                        page_sizes=page_sizes,
+                        page_sizes=download_page_sizes,
                         navigation_timeout_ms=book_navigation_timeout * 1000,
                         render_timeout_ms=book_render_timeout * 1000,
                         sleep_after_ready=sleep_after_ready,
                         backend=backend,
                         force=force,
-                        html_only=html_only,
+                        html_only=per_book_html_only,
                     )
                     LOGGER.info("Successfully completed %s", display_name)
                     successful_books.append(display_name)
+                    if book is not None:
+                        downloaded_book_html[book] = downloaded_html_path
                     
                     # Force garbage collection after each book to free memory
                     gc.collect()
@@ -875,6 +1142,86 @@ async def run_export(
                     LOGGER.warning("Skipping %s and continuing with next book", display_name)
                     failed_books.append((display_name, str(exc)))
 
+            if combine_all:
+                ordered_downloaded_books = sort_books_canonical(
+                    [
+                        raw_book
+                        for raw_book in book_sequence
+                        if raw_book is not None and raw_book.lower() in downloaded_book_html
+                    ]
+                )
+                if not ordered_downloaded_books:
+                    raise RuntimeError(
+                        "Could not generate combined all-books output because no book HTML files were downloaded."
+                    )
+                if failed_books:
+                    LOGGER.warning(
+                        "Building combined output with %d successful book(s); %d book(s) failed earlier.",
+                        len(ordered_downloaded_books),
+                        len(failed_books),
+                    )
+
+                combined_prefix = build_all_books_output_prefix(repo, ref)
+                combined_a4_html_path = output_dir / f"{combined_prefix}_A4.html"
+
+                if combined_a4_html_path.exists() and not force:
+                    LOGGER.info(
+                        "Combined HTML already exists: %s (skipping creation)",
+                        combined_a4_html_path.name,
+                    )
+                else:
+                    merged_html = build_all_books_html(
+                        repo=repo,
+                        ref=ref,
+                        ordered_books=ordered_downloaded_books,
+                        book_html_paths=downloaded_book_html,
+                    )
+                    combined_a4_html_path.write_text(merged_html, encoding="utf-8")
+                    LOGGER.info("Created combined all-books HTML: %s", combined_a4_html_path.name)
+
+                if html_only:
+                    combined_outputs.append(combined_a4_html_path.name)
+                else:
+                    combined_html_variants = {"A4": combined_a4_html_path}
+                    if "LETTER" in page_sizes:
+                        combined_letter_html_path = output_dir / f"{combined_prefix}_LETTER.html"
+                        if combined_letter_html_path.exists() and not force:
+                            LOGGER.info(
+                                "Combined LETTER HTML already exists: %s (skipping creation)",
+                                combined_letter_html_path.name,
+                            )
+                        else:
+                            create_letter_variant(
+                                source_html=combined_a4_html_path,
+                                destination_html=combined_letter_html_path,
+                            )
+                        combined_html_variants["LETTER"] = combined_letter_html_path
+
+                    for page_size in page_sizes:
+                        combined_html_path = combined_html_variants.get(page_size)
+                        if combined_html_path is None:
+                            continue
+
+                        pdf_destination = output_dir / f"{combined_prefix}_{page_size}.pdf"
+                        if pdf_destination.exists() and not force:
+                            LOGGER.info(
+                                "Combined PDF already exists: %s (skipping generation)",
+                                pdf_destination.name,
+                            )
+                            combined_outputs.append(pdf_destination.name)
+                            continue
+
+                        await render_html_to_pdf(
+                            context=context,
+                            html_path=combined_html_path,
+                            destination=pdf_destination,
+                            page_size=page_size,
+                            render_timeout_ms=render_timeout * 1000,
+                            sleep_after_ready=sleep_after_ready,
+                            backend=backend,
+                        )
+                        combined_outputs.append(pdf_destination.name)
+
         finally:
             await context.close()
             await browser.close()
@@ -885,10 +1232,15 @@ async def run_export(
     LOGGER.info("=" * 60)
     if html_only:
         LOGGER.info("Successfully downloaded HTML: %d book(s)", len(successful_books))
+    elif combine_all:
+        LOGGER.info("Successfully processed HTML for %d book(s)", len(successful_books))
     else:
         LOGGER.info("Successfully generated: %d book(s)", len(successful_books))
     if successful_books:
         LOGGER.info("  %s", ", ".join(successful_books))
+
+    if combined_outputs:
+        LOGGER.info("Combined output(s): %s", ", ".join(combined_outputs))
     
     if failed_books:
         LOGGER.warning("Failed to generate: %d book(s)", len(failed_books))
@@ -901,18 +1253,21 @@ def main() -> int:
     args = parse_args()
     configure_logging(args.verbose)
 
+    if args.no_proxy:
+        # Bypass any proxy for THIS process only (urllib catalog fetch + the Chromium child,
+        # which inherits this env). The parent shell / other apps keep their proxy + VPN.
+        for _var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+            os.environ.pop(_var, None)
+        os.environ["no_proxy"] = "*"
+        urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+        LOGGER.info("Proxy bypass enabled: direct connection for this process (urllib + Chromium --no-proxy-server)")
+
     if args.list_books:
         print_available_books()
         return 0
 
     try:
         page_sizes = resolve_page_sizes(args.page)
-    except ValueError as error:
-        LOGGER.error("%s", error)
-        return 1
-
-    try:
-        book_list = expand_book_arguments(args.books)
     except ValueError as error:
         LOGGER.error("%s", error)
         return 1
@@ -926,15 +1281,29 @@ def main() -> int:
         LOGGER.error("%s", error)
         return 1
 
+    # If --books not specified or 'all' specified, use all catalog books
+    if args.books is None:
+        book_list = None
+    else:
+        try:
+            book_list = expand_book_arguments(args.books)
+        except ValueError as error:
+            LOGGER.error("%s", error)
+            return 1
+
     # Handle bookless repos (e.g., en_ta, en_tw)
     if not available_books:
+        if args.all:
+            LOGGER.error("--all requires a book-based repo with catalog book identifiers.")
+            return 1
         LOGGER.info("Repo has no books - treating as single-page resource")
         selected_books = [None]  # Use None to represent the entire repo
         missing_books = []
-    # If book_list is None, it means 'all' was specified - use all available books
+    # If book_list is None, it means --books was not specified or 'all' was used
     elif book_list is None:
         selected_books = available_books
         missing_books = []
+        LOGGER.info("Processing all %d books from catalog", len(selected_books))
     else:
         available_set = set(available_books)
         selected_books = [book for book in book_list if book in available_set]
@@ -956,6 +1325,12 @@ def main() -> int:
         )
         return 1
 
+    if args.all:
+        selected_books = sort_books_canonical(book for book in selected_books if book is not None)
+        if not selected_books:
+            LOGGER.error("--all requires at least one valid book to merge.")
+            return 1
+
     LOGGER.info(
         "Starting export for %d book(s) with page size(s): %s",
         len(selected_books),
@@ -964,12 +1339,18 @@ def main() -> int:
     
     if args.html_only:
         LOGGER.info("HTML-only mode: PDFs will NOT be generated")
+    if args.all:
+        LOGGER.info(
+            "All-books mode enabled: per-book PDFs will be skipped and a combined all-books output will be created."
+        )
 
     try:
         asyncio.run(
             run_export(
                 books=selected_books,
                 base_url=args.base_url,
+                server=args.server,
+                no_proxy=args.no_proxy,
                 owner=args.owner,
                 repo=args.repo,
                 ref=args.ref,
@@ -984,6 +1365,7 @@ def main() -> int:
                 backend=args.backend,
                 force=args.force,
                 html_only=args.html_only,
+                combine_all=args.all,
             )
         )
     except RenderTimeoutError as error:
