@@ -59,7 +59,9 @@ The `None` sentinel for bookless repos threads through every function — preser
 `{base_url}/u/{owner}/{repo}/{ref}/?rerender=1&book={book}` (book omitted for bookless repos).
 `&rerender=1` forces a fresh render. `--base-url` defaults to `https://preview.door43.org`. The
 `--server` flag (create-pdfs) appends `&server=<value>` — use `--base-url https://develop-preview.door43.org
---server prod` to render via the develop site against production DCS data.
+--server prod` to render via the develop site against production DCS data. The `--no-proxy` flag clears
+`*_PROXY` env for *this process only* and forces Chromium `--no-proxy-server`, so door43 traffic goes direct
+while any system/VPN proxy stays up for everything else (needed e.g. behind a VPN where door43 isn't blocked).
 
 **3a. `load-pages` mode** (`load_preview_pages.py`): navigates each page and waits for the Netlify
 `cache-html` function POST (`/.netlify/functions/cache-html`) whose body path matches `/{book}.json.gz`
@@ -92,14 +94,19 @@ than emitting a mislabeled A4-sized "LETTER" file. This whole mechanism depends 
 `@page { size: 210mm 297mm; }` (fixed upstream in preview.door43.org v1.4.6); if upstream switches to the `A4`
 keyword form, update `LETTER_SIZE_PATTERN`.
 
-**Backend fidelity differs.** WeasyPrint is a *different* paged-media engine than the app's Paged.js, so it
-silently drops CSS features it doesn't fully support. Verified on en_tn: page counts match within ~1 page and
-body/boxes/links/page-numbers/cover all render correctly, but WeasyPrint **omits the running header**
-(`unfoldingWord® Translation Notes :: Ruth X:Y`) because it uses the CSS `running()`/`element()` feature.
-WeasyPrint also drops `@footnote`/`position: note(footnotes)` (footnote layout) and the `@page :cover-page`
-named-page rule (look for these in the run's `WARNING Ignored …` / `Unsupported @page selector` lines). Use
-Playwright when the output must match the on-screen print preview exactly; use WeasyPrint for speed when those
-features don't matter for the resource.
+**Backend fidelity & the running header.** WeasyPrint is a *different* paged-media engine than the app's
+Paged.js. The notes' per-page **running header** (`unfoldingWord® Translation Notes :: Ruth X:Y`) is built with
+Paged.js running elements (`.header-title { position: running(titleRunning) }` + `@top-center { content:
+element(titleRunning) }`), which WeasyPrint doesn't implement — so `inject_weasyprint_running_header()` rewrites
+it at render time into WeasyPrint-supported **named strings**: it sets `titleRunning` from the visible
+`[class*="verse-header"]` heading and feeds the top margin box a prefix auto-derived from the doc's own
+`.header-title` text (`tn-verse-header` → "Translation Notes ::", `tq-verse-header` → "Translation Questions ::").
+It's a no-op for the Bibles (no such header). WeasyPrint still drops `@footnote`/`position: note(footnotes)`
+(footnote layout) and the `@page :cover-page` named-page rule (look for `WARNING Ignored …` / `Unsupported @page
+selector` lines), and occasionally hits `min-content width for TextBox not handled yet` on a specific book
+(seen on en_tn ACT — regenerating that book's HTML cleared it). **Prefer WeasyPrint for everything**: it's fast,
+handles the giant notes books, and now keeps the running header. **Playwright times out on large notes books**
+(e.g. Genesis/Psalms TN, ~19 min then fails), so it is not viable for the notes.
 
 **4. Output naming** (`build_output_prefix`): `<repo>_<NN>-<BOOK>_<ref>_<SIZE>.{html,pdf}`
 (e.g. `en_tn_08-RUT_v89_A4.pdf`); bookless repos drop the book segment (`en_ta_v89_A4.pdf`). The CI assertions

@@ -768,16 +768,47 @@ async def export_pdf(page: Page, destination: Path, page_size: str) -> None:
     )
 
 
+HEADER_TITLE_RE = re.compile(r'<span[^>]*class="[^"]*header-title[^"]*"[^>]*>(.*?)</span>', re.IGNORECASE | re.DOTALL)
+RUNNING_ELEMENT_RE = re.compile(r'content:\s*element\(titleRunning\)', re.IGNORECASE)
+
+
+def inject_weasyprint_running_header(html: str) -> str:
+    """Make the per-page running header render under WeasyPrint.
+
+    The preview app builds the header with Paged.js *running elements*
+    (`.header-title { position: running(titleRunning) }` +
+    `@top-center { content: element(titleRunning) }`), which WeasyPrint does not
+    implement, so the header silently vanishes. WeasyPrint *does* support CSS named
+    strings, so we rewrite it: set `titleRunning` from the visible verse heading
+    (`*-verse-header`, e.g. `tn-verse-header`/`tq-verse-header`) and feed it into the
+    top margin box with the static prefix pulled from the doc's own header-title text
+    (e.g. "unfoldingWord® Translation Notes :: ").
+
+    No-op when the doc doesn't use this header (e.g. the aligned Bibles), so it's safe
+    to call for every resource.
+    """
+    if 'element(titleRunning)' not in html:
+        return html
+    spans = [s.strip() for s in HEADER_TITLE_RE.findall(html) if s.strip()]
+    prefix = next((s.split('::')[0].strip() + ' :: ' for s in spans if '::' in s), None)
+    if prefix is None:
+        return html  # no "<resource> :: <ref>" header text (e.g. Bibles) — leave unchanged
+    inject = '<style>[class*="verse-header"]{string-set:titleRunning content(text);}</style>'
+    html = html.replace('</head>', inject + '</head>', 1)
+    esc = prefix.replace('\\', '\\\\').replace('"', '\\"')
+    return RUNNING_ELEMENT_RE.sub(lambda m: f'content: "{esc}" string(titleRunning, start)', html)
+
+
 def render_html_to_pdf_weasyprint(
     html_path: Path,
     destination: Path,
     page_size: str,
 ) -> None:
     """Render HTML to PDF using WeasyPrint (synchronous server-side rendering).
-    
+
     This is significantly faster than waiting for Paged.js in the browser,
     especially for large documents (11MB+).
-    
+
     Args:
         html_path: Path to the HTML file to render
         destination: Path where the PDF should be written
@@ -788,6 +819,8 @@ def render_html_to_pdf_weasyprint(
     try:
         # Read HTML content as UTF-8
         html_content = html_path.read_text(encoding='utf-8')
+        # Recreate the Paged.js running header using WeasyPrint-supported named strings.
+        html_content = inject_weasyprint_running_header(html_content)
         # Use base_url to resolve relative paths in the HTML (for images, CSS, etc.)
         # Must use resolve() to convert relative path to absolute path before as_uri()
         html_doc = HTML(string=html_content, base_url=html_path.resolve().parent.as_uri() + '/')

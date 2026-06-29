@@ -132,14 +132,27 @@ jobs:
 - ✅ Much faster (10-100x)
 - ✅ Lower memory usage
 - ✅ Better for CI/CD
-- ❌ Different rendering than browser
+- ✅ Renders the giant notes books reliably (no timeouts)
+- ✅ Recreates the per-page running header for TN/TQ via CSS named-strings (auto-injected — no Paged.js needed)
+- ❌ Drops a few advanced Paged.js CSS features (footnote layout, `@page :cover-page`)
 
 ### Playwright (Paged.js)
 - ✅ Browser-identical rendering
 - ✅ Uses Paged.js pagination
 - ❌ Much slower
 - ❌ Higher memory usage
-- ❌ Can timeout on large files
+- ❌ **Times out on large notes books** (e.g. Genesis/Psalms Translation Notes) — use WeasyPrint for these
+
+## CLI-only flags
+
+These flags exist on `scripts/create_door43_preview_pdfs.py` (not yet exposed as action inputs):
+
+| Flag | Purpose |
+|------|---------|
+| `--server <value>` | Append `&server=<value>` to the preview URL (e.g. `--base-url https://develop-preview.door43.org --server prod` to render the develop site against production DCS data) |
+| `--no-proxy` | Bypass any `*_PROXY`/VPN proxy for this process only (door43 goes direct; useful behind a VPN where door43 isn't blocked) |
+| `--all` | Merge the selected books into one combined `<repo>_ALL_<ref>` PDF instead of one PDF per book |
+| `--html-only` | Download the print HTML without generating PDFs (handy for flaky connections) |
 
 ## Book Codes
 
